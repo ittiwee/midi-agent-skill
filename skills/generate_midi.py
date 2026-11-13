@@ -2,229 +2,228 @@
 """
 Generate MIDI file from a Composition object using midiutil.
 Uses General MIDI program changes compatible with A320U.sf2 SoundFont.
+
+Supports chords, rests, per-note velocity, absolute note starts, drum tracks
+(GM channel 10), mix controls (volume/pan/reverb/chorus), arbitrary CC and
+pitch-wheel events, time signature and tempo changes.
 """
 
-import os
+import math
 import re
 import sys
 from pathlib import Path
+from typing import List, Optional
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from midiutil import MIDIFile
-from midi_types.music import Composition
+from midi_types.music import Composition, Track
 from midi_types.gm_instruments import resolve_instrument
+from midi_types.notation import (  # noqa: F401  (re-exported for backward compatibility)
+    DURATION_MAP,
+    parse_duration,
+    parse_pitch,
+    split_pitches,
+)
+
+DRUM_CHANNEL = 9
+MELODIC_CHANNELS = [c for c in range(16) if c != DRUM_CHANNEL]  # 15 channels
+DRUM_INSTRUMENT_NAMES = {"drums", "drum", "drum-kit", "drumkit", "percussion", "standard-kit", "kit"}
+TICKS_PER_QUARTER = 960
 
 
-# Duration mapping: string notation to beats
-DURATION_MAP = {
-    "1": 4.0,      # whole note
-    "2": 2.0,      # half note
-    "d2": 3.0,     # dotted half
-    "4": 1.0,      # quarter note
-    "d4": 1.5,     # dotted quarter
-    "8": 0.5,      # eighth note
-    "d8": 0.75,    # dotted eighth
-    "16": 0.25,    # sixteenth note
-    "32": 0.125,   # thirty-second note
-    "T4": 1/3,     # triplet quarter
-    "T8": 1/6,     # triplet eighth
-}
+def is_drum_track(track: Track) -> bool:
+    if track.drums or track.channel == DRUM_CHANNEL:
+        return True
+    if track.instrument:
+        return re.sub(r"[\s_]+", "-", track.instrument.lower()) in DRUM_INSTRUMENT_NAMES
+    return False
 
 
-def parse_pitch(pitch_str: str) -> int:
+def track_program(track: Track) -> int:
+    return resolve_instrument(track.instrument) if track.instrument else 0
+
+
+def assign_channels(tracks: List[Track]) -> List[int]:
     """
-    Convert pitch string to MIDI note number.
+    Assign a MIDI channel to every track.
 
-    Examples:
-        "C4" -> 60
-        "A4" -> 69
-        "F#5" -> 78
-        "Bb3" -> 58
-
-    Args:
-        pitch_str: Pitch in format like "C4", "F#5", "Bb3"
-
-    Returns:
-        MIDI note number (0-127)
+    - Drum tracks go to channel 10 (index 9).
+    - Tracks with an explicit `channel` keep it.
+    - Other tracks get a free melodic channel. When all 15 are taken, a track
+      shares the channel of an earlier track using the same instrument.
+      If no such track exists, a ValueError is raised instead of silently
+      overlapping two different instruments on one channel.
     """
-    # Note names to semitones from C
-    note_map = {
-        'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11
-    }
+    channels: List[Optional[int]] = [None] * len(tracks)
+    used = set()
 
-    # Parse the pitch string
-    match = re.match(r'^([A-Ga-g])([#b]?)(-?\d+)$', pitch_str)
-    if not match:
-        raise ValueError(f"Invalid pitch format: {pitch_str}")
+    for i, track in enumerate(tracks):
+        if is_drum_track(track):
+            channels[i] = DRUM_CHANNEL
+        elif track.channel is not None:
+            if not 0 <= track.channel <= 15:
+                raise ValueError(f"Track {i}: channel must be 0-15, got {track.channel}")
+            channels[i] = track.channel
+            used.add(track.channel)
 
-    note, accidental, octave = match.groups()
-    note = note.upper()
-    octave = int(octave)
-
-    # Calculate MIDI note number
-    # MIDI note 60 = C4 (Middle C)
-    midi_note = (octave + 1) * 12 + note_map[note]
-
-    # Apply accidental
-    if accidental == '#':
-        midi_note += 1
-    elif accidental == 'b':
-        midi_note -= 1
-
-    return max(0, min(127, midi_note))
-
-
-def parse_duration(duration_str: str) -> float:
-    """
-    Convert duration string to beats.
-
-    Args:
-        duration_str: Duration notation (e.g., "4", "8", "d4", "T8")
-
-    Returns:
-        Duration in beats
-    """
-    # Try direct lookup
-    if duration_str in DURATION_MAP:
-        return DURATION_MAP[duration_str]
-
-    # Try to parse as a number (assume it's the note division)
-    try:
-        division = float(duration_str)
-        if division > 0:
-            return 4.0 / division  # 4 beats = whole note
-    except ValueError:
-        pass
-
-    # Default to quarter note
-    return 1.0
+    free = [c for c in MELODIC_CHANNELS if c not in used]
+    program_channel = {}
+    for i, track in enumerate(tracks):
+        if channels[i] is not None:
+            program_channel.setdefault(track_program(track), channels[i])
+            continue
+        program = track_program(track)
+        if free:
+            channels[i] = free.pop(0)
+            program_channel.setdefault(program, channels[i])
+        elif program in program_channel and program_channel[program] != DRUM_CHANNEL:
+            channels[i] = program_channel[program]
+        else:
+            raise ValueError(
+                f"Too many melodic instruments: track {i} ({track.instrument}) needs a channel "
+                f"but all 15 melodic channels are in use. Merge tracks that use the same "
+                f"instrument, or reuse an instrument already in the piece."
+            )
+    return channels  # type: ignore[return-value]
 
 
-def generate_midi(composition: Composition) -> str:
+def _ticks(beats: float) -> int:
+    """Beats -> integer ticks, rounded (midiutil itself truncates, which drops a tick)."""
+    return max(0, int(round(float(beats) * TICKS_PER_QUARTER)))
+
+
+def _clamp7(value) -> int:
+    return max(0, min(127, int(value)))
+
+
+def generate_midi(composition: Composition, output_path: Optional[str] = None) -> str:
     """
     Generate a MIDI file from a Composition object.
 
-    Each track is assigned to a different MIDI channel with its own instrument.
-    Channel 10 (index 9) is skipped as it's reserved for drums in General MIDI.
-
     Args:
         composition: The composition to convert to MIDI
+        output_path: Where to write the file (default: output/<title>.mid)
 
     Returns:
         The path to the generated MIDI file
     """
-    num_tracks = len(composition.tracks)
-    midi = MIDIFile(num_tracks)
+    tracks = composition.tracks
+    channels = assign_channels(tracks)
+    midi = MIDIFile(max(1, len(tracks)), file_format=1, ticks_per_quarternote=TICKS_PER_QUARTER,
+                    eventtime_is_ticks=True)
 
-    for track_idx, track in enumerate(composition.tracks):
-        # Assign MIDI channel (0-15, skip channel 9 which is drums)
-        # Channel 9 (index 9) is reserved for drums in GM
-        if track_idx < 9:
-            channel = track_idx
-        else:
-            channel = track_idx + 1  # Skip channel 9
+    # Global meta events on track 0
+    midi.addTempo(0, 0, composition.bpm)
+    for change in composition.tempo_changes:
+        midi.addTempo(0, _ticks(change["time"]), float(change["bpm"]))
+    if composition.time_signature:
+        num, den = composition.time_signature
+        if den <= 0 or den & (den - 1):
+            raise ValueError(f"Time signature denominator must be a power of 2, got {den}")
+        midi.addTimeSignature(0, 0, int(num), int(math.log2(den)), 24)
 
-        # Ensure we don't exceed 16 channels
-        channel = channel % 16
-        if channel == 9:
-            channel = 10 if track_idx < 15 else 0
+    for track_idx, track in enumerate(tracks):
+        channel = channels[track_idx]
+        drums = channel == DRUM_CHANNEL
 
-        # Set track name
-        track_name = track.instrument or f"Track {track_idx + 1}"
-        midi.addTrackName(track_idx, 0, track_name)
+        midi.addTrackName(track_idx, 0, track.name or track.instrument or f"Track {track_idx + 1}")
+        # On channel 10 the program selects the drum kit (0 = standard kit)
+        midi.addProgramChange(track_idx, channel, 0, 0 if drums else track_program(track))
 
-        # Set tempo on first track
-        if track_idx == 0:
-            midi.addTempo(track_idx, 0, composition.bpm)
+        for cc, value in ((7, track.volume), (10, track.pan), (91, track.reverb), (93, track.chorus)):
+            if value is not None:
+                midi.addControllerEvent(track_idx, channel, 0, cc, _clamp7(value))
 
-        # Set instrument (program change)
-        program = resolve_instrument(track.instrument) if track.instrument else 0
-        midi.addProgramChange(track_idx, channel, 0, program)
+        for ctrl in track.controls:
+            time = _ticks(ctrl.get("time", 0))
+            if "pitchwheel" in ctrl:
+                value = max(-8192, min(8191, int(ctrl["pitchwheel"])))
+                midi.addPitchWheelEvent(track_idx, channel, time, value)
+            elif "cc" in ctrl:
+                midi.addControllerEvent(track_idx, channel, time, int(ctrl["cc"]) & 0x7F,
+                                        _clamp7(ctrl.get("value", 0)))
 
-        # Add notes
-        time = 0.0  # Current time in beats
-        for note in track.notes:
-            try:
-                pitch = parse_pitch(note.pitch)
-                duration = parse_duration(note.duration)
-                velocity = 100  # Default velocity
+        default_velocity = track.velocity if track.velocity is not None else 100
 
-                midi.addNote(
-                    track=track_idx,
-                    channel=channel,
-                    pitch=pitch,
-                    time=time,
-                    duration=duration,
-                    volume=velocity
-                )
+        # The timeline always advances, even when a note is invalid, so one bad
+        # note can no longer shift the rest of the track out of sync.
+        for start, beats, note in track.timeline():
+            if note.is_rest or beats <= 0:
+                continue
+            velocity = max(1, min(127, int(note.velocity if note.velocity is not None
+                                           else default_velocity)))
+            for p in split_pitches(note.pitch):
+                try:
+                    pitch = parse_pitch(p)
+                except ValueError as e:
+                    print(f"Warning: track {track_idx}: skipping pitch at beat {start:g}: {e}",
+                          file=sys.stderr)
+                    continue
+                midi.addNote(track=track_idx, channel=channel, pitch=pitch,
+                             time=_ticks(start), duration=max(1, _ticks(beats)),
+                             volume=velocity)
 
-                time += duration
-            except Exception as e:
-                print(f"Warning: Skipping note {note.pitch} {note.duration}: {e}", file=sys.stderr)
+    if output_path:
+        file_path = Path(output_path)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        out_dir = Path(__file__).parent.parent / "output"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe_title = re.sub(r"[^a-zA-Z0-9_-]", "_", composition.title)
+        file_path = out_dir / f"{safe_title}.mid"
 
-    # Create output directory
-    out_dir = Path(__file__).parent.parent / "output"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Sanitize filename
-    safe_title = re.sub(r'[^a-zA-Z0-9_-]', '_', composition.title)
-    file_path = out_dir / f"{safe_title}.mid"
-
-    # Write MIDI file
-    with open(file_path, 'wb') as f:
+    with open(file_path, "wb") as f:
         midi.writeFile(f)
 
     return str(file_path)
 
 
-def generate_midi_from_dict(data: dict) -> str:
+def generate_midi_from_dict(data: dict, output_path: Optional[str] = None) -> str:
     """
     Generate MIDI from a dictionary representation.
 
     Args:
         data: Dictionary with title, bpm, and tracks
+        output_path: Optional output file path
 
     Returns:
         Path to the generated MIDI file
     """
     composition = Composition.from_dict(data)
-    return generate_midi(composition)
+    return generate_midi(composition, output_path)
 
 
 if __name__ == "__main__":
-    import json
-
-    # Example usage
     example = {
         "title": "Test Multi-Instrument",
         "bpm": 120,
+        "time_signature": [4, 4],
         "tracks": [
             {
                 "instrument": "acoustic-grand-piano",
                 "notes": [
-                    {"pitch": "C4", "duration": "4"},
-                    {"pitch": "E4", "duration": "4"},
-                    {"pitch": "G4", "duration": "4"},
-                    {"pitch": "C5", "duration": "2"}
+                    {"pitch": ["C4", "E4", "G4"], "duration": "2", "velocity": 80},
+                    {"pitch": "R", "duration": "4"},
+                    {"pitch": "C5", "duration": "4", "velocity": 110}
                 ]
             },
             {
                 "instrument": "acoustic-bass",
+                "pan": 40,
                 "notes": [
                     {"pitch": "C2", "duration": "2"},
-                    {"pitch": "G2", "duration": "2"},
-                    {"pitch": "C2", "duration": "1"}
+                    {"pitch": "G2", "duration": "2"}
                 ]
             },
             {
-                "instrument": "violin",
+                "instrument": "drums",
                 "notes": [
-                    {"pitch": "E5", "duration": "8"},
-                    {"pitch": "F5", "duration": "8"},
-                    {"pitch": "G5", "duration": "4"},
-                    {"pitch": "E5", "duration": "2"}
+                    {"pitch": "kick,hihat", "duration": "8"},
+                    {"pitch": "hihat", "duration": "8"},
+                    {"pitch": "snare,hihat", "duration": "8"},
+                    {"pitch": "hihat", "duration": "8"}
                 ]
             }
         ]

@@ -9,8 +9,10 @@
 - Generate MIDI from text prompts
 - 128 GM instruments - Full General MIDI support (A320U.sf2 compatible)
 - WAV export - Convert MIDI to audio using FluidSynth
+- Import existing MIDI files and enhance them (humanize, quantize, transpose, re-orchestrate, mix)
+- Chords, rests, per-note velocity, drum tracks, time signatures, tempo changes, CC / pitch bend
 - Claude Skills compatible - Automatic skill invocation
-- Python implementation using midiutil
+- Python implementation using midiutil (write) and mido (read)
 
 ---
 
@@ -21,10 +23,13 @@
 ├─ skills/                   # Skill implementation (Python)
 │   ├─ generate_midi.py          # MIDI file generation
 │   ├─ convert_to_wav.py         # MIDI to WAV conversion (FluidSynth)
+│   ├─ import_midi.py            # Existing MIDI → composition JSON
+│   ├─ enhance_midi.py           # Humanize / quantize / transpose / mix
 │   ├─ normalize_composition.py  # Input validation
 │   └─ refine_composition.py     # Adjust composition length
 ├─ midi_types/
 │   ├─ music.py                  # Composition types
+│   ├─ notation.py               # Pitch / duration / drum-name parsing
 │   └─ gm_instruments.py         # 128 GM instruments list
 ├─ resources/                # Music theory references
 │   ├─ music-theory.md
@@ -68,7 +73,7 @@ See `midi_types/gm_instruments.py` for the full list.
 ### 1. Install Python dependencies
 
 ```bash
-pip install midiutil
+pip install midiutil mido
 ```
 
 Or using requirements.txt:
@@ -165,19 +170,68 @@ The skill uses a structured JSON format:
 | `"d4"` | Dotted quarter (1.5 beats) |
 | `"8"` | Eighth note (0.5 beats) |
 | `"16"` | Sixteenth note (0.25 beats) |
+| `"32"` | Thirty-second note |
+| `"T4"`, `"T8"`, `"T16"` | Triplets |
+
+### Extended Note Options
+
+```json
+{ "pitch": ["C4", "E4", "G4"], "duration": "2", "velocity": 80 }
+{ "pitch": "R", "duration": "4" }
+{ "pitch": "D5", "start": 8, "beats": 0.4 }
+{ "pitch": ["kick", "hihat"], "duration": "8" }
+```
+
+- `pitch`: note name, MIDI number, chord (list or `"C4,E4,G4"`), rest (`"R"`), or drum name on drum tracks
+- `velocity`: 1–127 (default 100)
+- `start` / `beats`: absolute position and exact length in beats (optional)
+- Track options: `drums`, `velocity`, `volume`, `pan`, `reverb`, `chorus`, `controls`, `name`
+- Composition options: `time_signature` (e.g. `[3, 4]`), `tempo_changes`
+
+---
+
+## Improving Existing MIDI Files
+
+```python
+from skills import import_midi, enhance_midi_file, generate_midi_from_dict
+
+# 1. Read a MIDI file into editable JSON
+data = import_midi("my_song.mid")
+
+# 2a. Apply ready-made enhancements and write a new file
+enhance_midi_file("my_song.mid", [
+    {"op": "humanize", "timing": 0.015, "velocity": 8},
+    {"op": "dynamics", "low": 55, "high": 115},
+    {"op": "set_instrument", "track": 0, "instrument": "electric-piano-1"},
+    {"op": "set_mix", "track": 0, "reverb": 50},
+], "output/my_song_enhanced.mid")
+
+# 2b. Or edit `data` (e.g. ask Claude to reharmonize or add parts) and regenerate
+generate_midi_from_dict(data, "output/my_song_edited.mid")
+```
+
+Command line:
+
+```bash
+python skills/import_midi.py my_song.mid output/my_song.json
+python skills/enhance_midi.py my_song.mid output/out.mid '[{"op":"humanize"},{"op":"transpose","semitones":2}]'
+```
+
+Preserved on import: notes, velocities, chords, drums, instruments, track names, tempo changes,
+time signature, CC and pitch bend. Not preserved: SysEx, lyrics/markers, mid-track program changes.
 
 ---
 
 ## API Reference
 
-### `generate_midi(composition: Composition) -> str`
+### `generate_midi(composition: Composition, output_path: str = None) -> str`
 
 Generate a MIDI file from a Composition object.
 
 - **Input**: Composition object with title, bpm, and tracks
 - **Output**: Path to the generated `.mid` file
 
-### `generate_midi_from_dict(data: dict) -> str`
+### `generate_midi_from_dict(data: dict, output_path: str = None) -> str`
 
 Generate a MIDI file from a dictionary.
 
@@ -190,6 +244,14 @@ Convert a MIDI file to WAV using FluidSynth and A320U.sf2.
 
 - **Input**: Path to MIDI file
 - **Output**: Path to the generated `.wav` file
+
+### `import_midi(midi_path: str) -> dict`
+
+Read an existing MIDI file into the composition format (every note gets an absolute `start`).
+
+### `enhance_midi_file(input_path: str, operations: list, output_path: str = None) -> str`
+
+Import, apply operations (`humanize`, `quantize`, `transpose`, `set_instrument`, `set_mix`, `dynamics`), and write a new MIDI file.
 
 ### `normalize_composition(data: Any) -> Composition`
 
@@ -227,7 +289,7 @@ Compose a classical piece with violin, cello, and harpsichord
 - The `skills/` directory contains **pre-built Python scripts that Claude must use**
 - Claude should **NOT write custom code** - it should use the provided functions
 - All instruments are GM-compatible for A320U.sf2 playback
-- **Each track is assigned to a different MIDI channel** for proper multi-instrument playback
+- **Each track is assigned to a different MIDI channel** for proper multi-instrument playback (drums always use channel 10; beyond 15 melodic tracks, only tracks reusing an existing instrument can share its channel)
 
 ---
 

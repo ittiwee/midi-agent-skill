@@ -131,3 +131,14 @@ dist
 .pnp.*
 
 .DS_Store
+
+### Python
+__pycache__/
+*.pyc
+
+### Local assets
+soundfonts/*.sf2
+soundfonts/*.SF2
+*:Zone.Identifier
+output/*
+!output/.gitkeep

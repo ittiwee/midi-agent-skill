@@ -4,21 +4,46 @@ Refine composition by adjusting length and other properties.
 """
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from midi_types.music import Composition, Track, Note
+from midi_types.music import Composition, Note, Track
+from midi_types.notation import parse_duration
+
+
+def _uses_absolute_time(track: Track) -> bool:
+    return any(n.start is not None for n in track.notes)
+
+
+def _copy(note: Note, offset: float) -> Note:
+    """Copy a note; shift it by `offset` beats if it has an absolute start."""
+    if note.start is None:
+        return replace(note)
+    return replace(note, start=note.start + offset)
+
+
+def _loop_until(track: Track, done) -> None:
+    """Append repeats of the track's original notes until done(count, end_beat) is true."""
+    base = list(track.notes)
+    period = track.end_beat() if _uses_absolute_time(track) else 0.0
+    if not base or (_uses_absolute_time(track) and period <= 0):
+        return
+    repeat = 1
+    while not done(len(track.notes), track.end_beat()):
+        for note in base:
+            if done(len(track.notes), track.end_beat()):
+                return
+            track.notes.append(_copy(note, period * repeat))
+        repeat += 1
 
 
 def refine_composition(composition: Composition, min_notes: int = 16) -> Composition:
     """
-    Refine a composition by ensuring minimum note count per track.
-
-    If a track has fewer notes than min_notes, the existing notes are
-    repeated to reach the minimum.
+    Ensure each track has at least `min_notes` notes by repeating its material.
 
     Args:
         composition: The composition to refine
@@ -29,13 +54,7 @@ def refine_composition(composition: Composition, min_notes: int = 16) -> Composi
     """
     for track in composition.tracks:
         if 0 < len(track.notes) < min_notes:
-            base = list(track.notes)  # Copy original notes
-            while len(track.notes) < min_notes:
-                for note in base:
-                    if len(track.notes) >= min_notes:
-                        break
-                    track.notes.append(Note(pitch=note.pitch, duration=note.duration))
-
+            _loop_until(track, lambda count, end: count >= min_notes)
     return composition
 
 
@@ -55,62 +74,40 @@ def refine_from_dict(data: Dict[str, Any], min_notes: int = 16) -> Dict[str, Any
     return refined.to_dict()
 
 
-def extend_composition(composition: Composition, target_bars: int = 8, beats_per_bar: int = 4) -> Composition:
+def extend_composition(composition: Composition, target_bars: int = 8,
+                       beats_per_bar: int = None) -> Composition:
     """
-    Extend composition to reach a target number of bars.
+    Extend composition to reach a target number of bars by repeating material.
 
     Args:
         composition: The composition to extend
         target_bars: Target number of bars
-        beats_per_bar: Beats per bar (time signature numerator)
+        beats_per_bar: Beats per bar (default: from time_signature, else 4)
 
     Returns:
         Extended composition
     """
+    if beats_per_bar is None:
+        if composition.time_signature:
+            num, den = composition.time_signature
+            beats_per_bar = num * 4 / den
+        else:
+            beats_per_bar = 4
     target_beats = target_bars * beats_per_bar
 
     for track in composition.tracks:
-        if not track.notes:
-            continue
-
-        # Calculate current duration
-        current_beats = sum(_duration_to_beats(n.duration) for n in track.notes)
-
-        if current_beats >= target_beats:
-            continue
-
-        # Repeat notes to fill target duration
-        base = list(track.notes)
-        base_beats = current_beats
-
-        while current_beats < target_beats:
-            for note in base:
-                if current_beats >= target_beats:
-                    break
-                track.notes.append(Note(pitch=note.pitch, duration=note.duration))
-                current_beats += _duration_to_beats(note.duration)
+        if track.notes and track.end_beat() < target_beats:
+            _loop_until(track, lambda count, end: end >= target_beats - 1e-9)
 
     return composition
 
 
 def _duration_to_beats(duration_str: str) -> float:
-    """Convert duration string to beats."""
-    duration_map = {
-        "1": 4.0, "2": 2.0, "d2": 3.0, "4": 1.0, "d4": 1.5,
-        "8": 0.5, "d8": 0.75, "16": 0.25, "32": 0.125
-    }
-
-    if duration_str in duration_map:
-        return duration_map[duration_str]
-
+    """Convert duration string to beats (kept for backward compatibility)."""
     try:
-        division = float(duration_str)
-        if division > 0:
-            return 4.0 / division
+        return parse_duration(duration_str)
     except ValueError:
-        pass
-
-    return 1.0
+        return 1.0
 
 
 if __name__ == "__main__":
